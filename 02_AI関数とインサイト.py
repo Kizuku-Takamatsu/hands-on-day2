@@ -98,18 +98,116 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## （補足）自分専用の「カスタムAI関数」も作れます — ただし本研修では扱いません
-# MAGIC 組込みの `ai_query` のほかに、Unity Catalog の **カスタム関数（UC Function）** として
+# MAGIC ## 4. 実践：カスタムAI関数を作ってみよう
+# MAGIC 組込みの `ai_gen` のほかに、Unity Catalog の **カスタム関数（UC Function）** として
 # MAGIC 「自社専用の処理 ＋ AI呼び出し」をSQL関数化して再利用できます。
-# MAGIC 本研修では**範囲外**（時間の都合）としますが、「組込み・自作の両方のAI関数を部品化して使える」と覚えておいてください。
 # MAGIC
-# MAGIC > 💡 実は **⑤（統合エージェント）** では、この UC Function を「**エージェントのツール**」として実際に作ります。お楽しみに。
+# MAGIC ここでは `analyze_sales_trend` という関数を作り、セグメント別の売上トレンドを分析させます。
+# MAGIC
+# MAGIC > 💡 この UC Function は **⑤（統合エージェント）** で「**エージェントのツール**」としても活用できます。
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ1: 関数の説明
+# MAGIC %md
+# MAGIC ### ステップ1：カスタムAI関数を定義する
+# MAGIC
+# MAGIC `analyze_sales_trend` 関数をUC Functionとして作成します。
+# MAGIC
+# MAGIC **入力：**
+# MAGIC - `segment`: 顧客セグメント名
+# MAGIC - `recent_months_data`: 直近3ヶ月の売上データ（JSON形式）
+# MAGIC
+# MAGIC **出力：**
+# MAGIC - AIが生成したトレンド分析と戦略提案（日本語、150字以内）
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ1: 関数作成
+if ai_available:
+    # 既存の関数があれば削除
+    try:
+        spark.sql(f"DROP FUNCTION IF EXISTS {ns}.analyze_sales_trend")
+    except:
+        pass
+    
+    # UC Function としてカスタムAI関数を作成
+    spark.sql(f"""
+    CREATE FUNCTION {ns}.analyze_sales_trend(
+      segment STRING,
+      recent_months_data STRING
+    )
+    RETURNS STRING
+    RETURN ai_gen(
+      '次の顧客セグメントの直近3ヶ月の売上トレンドを分析し、' ||
+      '経営層向けに（①トレンド要約 ②戦略提案）を150字以内の日本語で返して。' ||
+      'セグメント=' || segment || ' / ' ||
+      '直近3ヶ月のデータ=' || recent_months_data
+    )
+    """)
+    
+    print(f"✅ カスタムAI関数 `{ns}.analyze_sales_trend` を作成しました")
+    print("\n💡 この関数は他のノートブックやSQLクエリからも呼び出し可能です")
+else:
+    print("⏭️ スキップしました（AI関数が未対応の環境）。")
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ2: 関数の説明
+# MAGIC %md
+# MAGIC ### ステップ2：作成した関数を実際に使ってみる
+# MAGIC
+# MAGIC `sales_monthly_gold` テーブルから各セグメントの直近3ヶ月の売上データを取得し、
+# MAGIC 作成した `analyze_sales_trend` 関数にAI分析させます。
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ2: 関数実行
+if ai_available:
+    sql = f"""
+    WITH recent_data AS (
+      -- 各セグメントの直近3ヶ月の売上推移を取得
+      SELECT 
+        market_segment,
+        concat_ws(', ',
+          collect_list(
+            concat(
+              date_format(order_month, 'yyyy-MM'), ': ',
+              cast(round(total_sales/1e6, 1) as string), '百万'
+            )
+          )
+        ) AS monthly_trend
+      FROM (
+        SELECT market_segment, order_month, total_sales
+        FROM {ns}.sales_monthly_gold
+        WHERE order_month >= add_months(current_date(), -3)
+        ORDER BY market_segment, order_month
+      )
+      GROUP BY market_segment
+    )
+    SELECT 
+      market_segment AS `セグメント`,
+      monthly_trend AS `直近3ヶ月の推移`,
+      {ns}.analyze_sales_trend(market_segment, monthly_trend) AS `AI分析・戦略提案`
+    FROM recent_data
+    ORDER BY market_segment
+    """
+    
+    print("✅ カスタムAI関数を実行中...（AIが分析を生成します）\n")
+    display(spark.sql(sql))
+else:
+    print("⏭️ スキップしました（AI関数が未対応の環境）。")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## まとめ
-# MAGIC - `ai_query` / `ai_gen` などで、**SQLの中から直接AIを呼べる**
+# MAGIC - `ai_gen` / `ai_classify` などで、**SQLの中から直接AIを呼べる**
 # MAGIC - 分類・要約・感情分析・翻訳も関数1つ
-# MAGIC - カスタムAI関数（UC Function）で自社専用の部品化も可能（本研修は範囲外）
+# MAGIC - **カスタムAI関数（UC Function）で自社専用の部品化が可能** ← 実際に `analyze_sales_trend` を作成！
+# MAGIC - UC Function は **⑤統合エージェントのツール** としても活用できる
+# MAGIC
 # MAGIC 次は **③RAGナレッジ**（社内文書をAIが読めるようにする）へ。
+
+# COMMAND ----------
+

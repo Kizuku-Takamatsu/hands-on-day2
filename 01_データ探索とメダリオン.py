@@ -132,31 +132,61 @@ display(df_preview.limit(10))
 
 # COMMAND ----------
 
-# DBTITLE 1,セル13
+# DBTITLE 1,Bronzeテーブル作成の説明
+# MAGIC %md
+# MAGIC #### Bronzeテーブルの作成（生データをそのまま保存）
+# MAGIC
+# MAGIC CSVファイルを読み込み、**監査列**（`_datasource`, `_ingest_timestamp`）を付加してBronzeテーブルに保存します。
+# MAGIC
+# MAGIC **Bronzeの原則：**
+# MAGIC * **全列をSTRING型**で保存（型変換エラーを防ぐ）
+# MAGIC * **重複・不良データもそのまま保存**（データ損失を防ぐ）
+# MAGIC * **監査列でトレーサビリティを確保**（どのファイルから、いつ取り込まれたか）
+# MAGIC
+# MAGIC 次のセルで、この処理を実行します。
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ1: CSVを読み込んで監査列を付加
 from pyspark.sql import functions as F
 
-# CSV ファイルから読み込んで _metadata を利用
-df = (spark.read.format("csv").option("header", True).option("inferSchema", False).load(orders_raw))
+# CSVファイルを読み込み、監査列（_datasource, _ingest_timestamp）を付加
+df = spark.read.format("csv").option("header", True).option("inferSchema", False).load(orders_raw)
 df = (df.select("*", "_metadata")
         .withColumn("_datasource", F.col("_metadata.file_path"))
         .withColumn("_ingest_timestamp", F.col("_metadata.file_modification_time"))
         .drop("_metadata"))
 
-# Bronze テーブルに書き込む前に、読み込んだデータの内容を確認
-print("=== CSV から読み込んだデータの統計(Bronze 書き込み前) ===")
+# 付加した監査列を含めて、読み込んだデータを確認
+print("✅ CSVを読み込み、監査列を付加しました")
+print(f"総行数: {df.count()}")
+print("\n【データのサンプル（監査列付き）】")
+display(df.limit(10))
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ2: 書き込み前の統計確認（不良データの把握）
+# Bronze に保存する前に、どれだけ不良データが含まれているか確認
+print("=== 書き込み前のデータ統計 ===")
 total_count = df.count()
-# 空文字列とNULLの両方をチェック
 bad_amount_count = df.filter((F.col('order_amount') == '') | F.col('order_amount').isNull()).count()
 bad_date_count = df.filter((F.col('order_date') == '') | F.col('order_date').isNull()).count()
-dup_order_ids = df.groupBy("order_id").count().filter(F.col("count") > 1)
-dup_count = dup_order_ids.count()
+dup_count = df.groupBy("order_id").count().filter(F.col("count") > 1).count()
+
 print(f"総行数: {total_count}")
 print(f"金額欠損の行数: {bad_amount_count}")
 print(f"日付欠損の行数: {bad_date_count}")
 print(f"重複している order_id の数: {dup_count}")
-print(f"\n💡 この不良データが Bronze テーブルにそのまま保存され、Silver でクレンジングされます")
+print(f"\n💡 この不良データを Bronze テーブルにそのまま保存します（データ損失を防ぐため）")
 
-# Bronze テーブルを作成(全列 STRING = 生データのまま)
+# 不良データのサンプルを表示
+print("\n【不良データのサンプル（金額欠損）】")
+display(df.filter((F.col('order_amount') == '') | F.col('order_amount').isNull()).limit(3))
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ3: Bronzeテーブル作成 + データ書き込み
+# Bronze テーブルを作成（全列 STRING = 生データのまま）
 spark.sql(f"""
 CREATE OR REPLACE TABLE {ns}.med_orders__bronze (
   order_id STRING, order_date STRING, order_priority STRING,
@@ -165,20 +195,30 @@ CREATE OR REPLACE TABLE {ns}.med_orders__bronze (
   _ingest_timestamp TIMESTAMP
 ) USING delta
 """)
+
+# データを書き込み
 df.write.format("delta").mode("overwrite").option("mergeSchema", True).saveAsTable(f"{ns}.med_orders__bronze")
 
-# Bronze テーブル作成後の確認
-print("\n=== Bronze テーブルの統計(書き込み後) ===")
-bronze_total = spark.table(f'{ns}.med_orders__bronze').count()
-# NULLと空文字列の両方をチェック
-bronze_bad_count = spark.sql(f"SELECT count(*) FROM {ns}.med_orders__bronze WHERE order_amount='' OR order_amount IS NULL OR order_date='' OR order_date IS NULL").first()[0]
-print(f"Bronze 総行数(重複・不良込み): {bronze_total}")
-print(f"うち 金額または日付が空の不良行: {bronze_bad_count}")
+print("✅ Bronze テーブルにデータを書き込みました")
 
-print("\n【Bronze の不良データサンプル(金額欠損)】")
+# COMMAND ----------
+
+# DBTITLE 1,ステップ4: 書き込み後の確認（Bronzeテーブルの検証）
+# Bronze テーブルから統計を再取得
+print("=== Bronze テーブルの統計（書き込み後） ===")
+bronze_total = spark.table(f'{ns}.med_orders__bronze').count()
+bronze_bad_count = spark.sql(f"SELECT count(*) FROM {ns}.med_orders__bronze WHERE order_amount='' OR order_amount IS NULL OR order_date='' OR order_date IS NULL").first()[0]
+
+print(f"Bronze 総行数（重複・不良込み）: {bronze_total}")
+print(f"うち 金額または日付が空の不良行: {bronze_bad_count}")
+print(f"\n💡 次の Silver レイヤーで、この不良データがクレンジングされます")
+
+# Bronzeテーブルのサンプルを表示
+print("\n【Bronze テーブルのサンプル】")
+display(spark.sql(f"SELECT * FROM {ns}.med_orders__bronze LIMIT 10"))
+
+print("\n【Bronze の不良データサンプル（金額欠損）】")
 display(spark.sql(f"SELECT order_id, order_date, order_amount, cust_id FROM {ns}.med_orders__bronze WHERE order_amount='' OR order_amount IS NULL LIMIT 3"))
-print("【Bronze の不良データサンプル(日付欠損)】")
-display(spark.sql(f"SELECT order_id, order_date, order_amount, cust_id FROM {ns}.med_orders__bronze WHERE order_date='' OR order_date IS NULL LIMIT 3"))
 
 # COMMAND ----------
 
@@ -188,7 +228,21 @@ display(spark.sql(f"SELECT order_id, order_date, order_amount, cust_id FROM {ns}
 
 # COMMAND ----------
 
-# 顧客マスタを「全列文字列」で生CSV化
+# DBTITLE 1,Bronzeテーブル作成（顧客マスタ）の説明
+# MAGIC %md
+# MAGIC #### Bronzeテーブルの作成（顧客マスタ）
+# MAGIC
+# MAGIC 受注データと同じ要領で、顧客マスタのBronzeテーブルを作成します。
+# MAGIC 次の4ステップで進めます：
+# MAGIC 1. CSV作成 + 読み込み + 監査列付加
+# MAGIC 2. データ確認
+# MAGIC 3. Bronzeテーブル作成 + データ書き込み
+# MAGIC 4. 書き込み後の確認
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ1: CSV作成 + 読み込み + 監査列付加
+# 顧客マスタを「全列文字列」でCSV作成
 custs_base = spark.sql("""
   SELECT CAST(c.c_custkey AS STRING)  AS cust_id,
          c.c_name                     AS customer_name,
@@ -199,21 +253,53 @@ custs_base = spark.sql("""
 """)
 custs_base.write.mode("overwrite").option("header", True).csv(custs_raw)
 
-# Bronze（全列 STRING ＋ 監査列）
+# CSVを読み込み、監査列を付加
+dfc = spark.read.format("csv").option("header", True).option("inferSchema", False).load(custs_raw)
+dfc = (dfc.select("*", "_metadata")
+          .withColumn("_datasource", F.col("_metadata.file_path"))
+          .withColumn("_ingest_timestamp", F.col("_metadata.file_modification_time"))
+          .drop("_metadata"))
+
+print("✅ 顧客マスタCSVを作成し、監査列を付加しました")
+print(f"総行数: {dfc.count()}")
+print("\n【データのサンプル（監査列付き）】")
+display(dfc.limit(10))
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ2: データ確認
+# 顧客マスタはマスタデータなので、通常は不良データはない想定
+print("=== 書き込み前のデータ確認 ===")
+print(f"総行数: {dfc.count()}")
+print(f"ユニークな顧客ID数: {dfc.select('cust_id').distinct().count()}")
+print("\n💡 顧客マスタはクリーンなデータとしてBronzeに保存します")
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ3: Bronzeテーブル作成 + データ書き込み
+# Bronzeテーブルを作成（全列 STRING ＋ 監査列）
 spark.sql(f"""
 CREATE OR REPLACE TABLE {ns}.med_customers__bronze (
   cust_id STRING, customer_name STRING, market_segment STRING, nation STRING,
   _datasource STRING, _ingest_timestamp TIMESTAMP
 ) USING delta
 """)
-dfc = (spark.read.format("csv").option("header", True).option("inferSchema", False).load(custs_raw))
-dfc = (dfc.select("*", "_metadata")
-          .withColumn("_datasource", F.col("_metadata.file_path"))
-          .withColumn("_ingest_timestamp", F.col("_metadata.file_modification_time"))
-          .drop("_metadata"))
-dfc.write.format("delta").mode("append").option("mergeSchema", True).saveAsTable(f"{ns}.med_customers__bronze")
-print("med_customers__bronze 行数:", spark.table(f"{ns}.med_customers__bronze").count())
-display(spark.sql(f"SELECT * FROM {ns}.med_customers__bronze LIMIT 5"))
+
+# データを書き込み
+dfc.write.format("delta").mode("overwrite").option("mergeSchema", True).saveAsTable(f"{ns}.med_customers__bronze")
+
+print("✅ Bronzeテーブルに顧客マスタデータを書き込みました")
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ4: 書き込み後の確認
+# Bronzeテーブルから統計を再取得
+print("=== Bronzeテーブルの確認（書き込み後） ===")
+bronze_cust_count = spark.table(f"{ns}.med_customers__bronze").count()
+print(f"Bronze 顧客マスタ 総行数: {bronze_cust_count}")
+
+print("\n【Bronzeテーブルのサンプル】")
+display(spark.sql(f"SELECT * FROM {ns}.med_customers__bronze LIMIT 10"))
 
 # COMMAND ----------
 
@@ -229,7 +315,20 @@ display(spark.sql(f"SELECT * FROM {ns}.med_customers__bronze LIMIT 5"))
 
 # COMMAND ----------
 
-# Silver（正しい型 ＋ 監査列）。空テーブルを作り、MERGE でアップサート
+# DBTITLE 1,Silverテーブル作成の説明
+# MAGIC %md
+# MAGIC #### Silverテーブルの作成（型変換・重複排除・MERGE）
+# MAGIC
+# MAGIC Bronze（全列STRING・重複あり）から、以下の処理を行いSilverテーブルを作成します：
+# MAGIC 1. **空のSilverテーブル作成**（正しい型定義）
+# MAGIC 2. **Bronzeからの変換処理**（主キーごとに最新取得 + 型変換 + 不良データ除去 + 重複排除）
+# MAGIC 3. **MERGE実行**（アップサート）
+# MAGIC 4. **Silver確認**（Bronzeとの件数比較）
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ1: Silverテーブル作成（空テーブル）
+# Silverテーブルを作成（正しい型定義 + 監査列）
 spark.sql(f"""
 CREATE OR REPLACE TABLE {ns}.med_orders__silver (
   order_id LONG, order_date DATE, order_priority STRING,
@@ -238,26 +337,42 @@ CREATE OR REPLACE TABLE {ns}.med_orders__silver (
 ) USING delta
 """)
 
-# 1.主キーごとに最新 _ingest_timestamp を採用 → 2.型変換 → 3.重複排除
+print("✅ Silverテーブルを作成しました（空テーブル）")
+print("\n💡 Bronze（全列STRING）と違い、Silverは正しい型（LONG, DATE, DOUBLE）で定義します")
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ2: Bronzeからの変換処理（型変換 + 重複排除 + 不良データ除去）
+# BronzeからSilverへの変換：主キーごとに最新 + 型変換 + 不良データ除去 + 重複排除
 brz_to_slv = spark.sql(f"""
-  WITH latest AS (   -- 主キーごとに最新の取り込み分だけ残す
+  WITH latest AS (
+    -- 主キーごとに最新の取り込み分だけ残す
     SELECT order_id, MAX(_ingest_timestamp) AS max_ts
     FROM {ns}.med_orders__bronze GROUP BY order_id
   )
   SELECT CAST(b.order_id     AS LONG)   AS order_id,
          CAST(b.order_date   AS DATE)   AS order_date,
-         upper(trim(b.order_priority)) AS order_priority,   -- 表記ゆれを正規化（前後空白除去・大文字化）
+         upper(trim(b.order_priority)) AS order_priority,   -- 表記ゆれを正規化
          CAST(b.order_amount AS DOUBLE) AS order_amount,
          CAST(b.cust_id      AS LONG)   AS cust_id,
          b._datasource, b._ingest_timestamp
   FROM {ns}.med_orders__bronze b
   JOIN latest l ON b.order_id = l.order_id AND b._ingest_timestamp = l.max_ts
-  WHERE b.order_amount IS NOT NULL AND b.order_amount <> ''   -- 金額欠損の不良行を除去
-    AND b.order_date  IS NOT NULL AND b.order_date  <> ''     -- 日付欠損の不良行を除去
+  WHERE b.order_amount IS NOT NULL AND b.order_amount <> ''   -- 金額欠損除去
+    AND b.order_date  IS NOT NULL AND b.order_date  <> ''     -- 日付欠損除去
 """).dropDuplicates(["order_id"])
 
-# 一時ビュー経由で MERGE（アップサート）。何度実行しても重複しない＝冪等
+print("✅ Bronzeからの変換処理が完了しました")
+print(f"変換後のデータ行数: {brz_to_slv.count()}")
+print("\n【変換後のデータサンプル】")
+display(brz_to_slv.limit(10))
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ3: MERGE実行（アップサート）
+# 一時ビューを作成し、MERGEでSilverテーブルにアップサート
 brz_to_slv.createOrReplaceTempView("_tmp_orders_silver")
+
 spark.sql(f"""
   MERGE INTO {ns}.med_orders__silver AS tgt
   USING _tmp_orders_silver AS src
@@ -266,9 +381,22 @@ spark.sql(f"""
   WHEN NOT MATCHED THEN INSERT *
 """)
 
-# 確認：重複排除＋不良行除去で件数が減り、型も正しく・優先度も正規化されている（Bronzeとの違い）
-print("Bronze 行数（重複・不良込み）            :", spark.table(f"{ns}.med_orders__bronze").count())
-print("Silver 行数（重複排除・不良除去・型付き）:", spark.table(f"{ns}.med_orders__silver").count())
+print("✅ MERGE処理が完了しました（アップサート）")
+print("\n💡 MERGEは何度実行しても重複しない冪等性を保ちます")
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ4: Silver確認（Bronzeとの比較）
+# SilverテーブルとBronzeテーブルを比較
+print("=== Bronze vs Silver の比較 ===")
+bronze_count = spark.table(f"{ns}.med_orders__bronze").count()
+silver_count = spark.table(f"{ns}.med_orders__silver").count()
+
+print(f"Bronze 行数（重複・不良込み）            : {bronze_count}")
+print(f"Silver 行数（重複排除・不良除去・型付き）: {silver_count}")
+print(f"削減された行数                        : {bronze_count - silver_count}")
+
+print("\n【Silverテーブルのサンプル】")
 display(spark.sql(f"SELECT * FROM {ns}.med_orders__silver LIMIT 10"))
 
 # COMMAND ----------
@@ -279,12 +407,29 @@ display(spark.sql(f"SELECT * FROM {ns}.med_orders__silver LIMIT 10"))
 
 # COMMAND ----------
 
+# DBTITLE 1,Silverテーブル作成（顧客マスタ）の説明
+# MAGIC %md
+# MAGIC #### Silverテーブルの作成（顧客マスタ）
+# MAGIC
+# MAGIC 受注データと同じ要領で、顧客マスタSilverテーブルを作成します。
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ1: Silverテーブル作成（空テーブル）
+# Silverテーブルを作成（正しい型定義 + 監査列）
 spark.sql(f"""
 CREATE OR REPLACE TABLE {ns}.med_customers__silver (
   cust_id LONG, customer_name STRING, market_segment STRING, nation STRING,
   _datasource STRING, _ingest_timestamp TIMESTAMP
 ) USING delta
 """)
+
+print("✅ 顧客マスタSilverテーブルを作成しました（空テーブル）")
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ2: Bronzeからの変換処理（型変換 + 重複排除）
+# BronzeからSilverへの変換：主キーごとに最新 + 型変換 + 重複排除
 c_brz_to_slv = spark.sql(f"""
   WITH latest AS (
     SELECT cust_id, MAX(_ingest_timestamp) AS max_ts
@@ -295,7 +440,18 @@ c_brz_to_slv = spark.sql(f"""
   FROM {ns}.med_customers__bronze b
   JOIN latest l ON b.cust_id = l.cust_id AND b._ingest_timestamp = l.max_ts
 """).dropDuplicates(["cust_id"])
+
+print("✅ Bronzeからの変換処理が完了しました")
+print(f"変換後のデータ行数: {c_brz_to_slv.count()}")
+print("\n【変換後のデータサンプル】")
+display(c_brz_to_slv.limit(10))
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ3: MERGE実行（アップサート）
+# 一時ビューを作成し、MERGEでSilverテーブルにアップサート
 c_brz_to_slv.createOrReplaceTempView("_tmp_customers_silver")
+
 spark.sql(f"""
   MERGE INTO {ns}.med_customers__silver AS tgt
   USING _tmp_customers_silver AS src
@@ -303,7 +459,19 @@ spark.sql(f"""
   WHEN MATCHED AND tgt._ingest_timestamp < src._ingest_timestamp THEN UPDATE SET *
   WHEN NOT MATCHED THEN INSERT *
 """)
-display(spark.sql(f"SELECT * FROM {ns}.med_customers__silver LIMIT 5"))
+
+print("✅ MERGE処理が完了しました（アップサート）")
+
+# COMMAND ----------
+
+# DBTITLE 1,ステップ4: Silver確認
+# Silverテーブルの確認
+print("=== Silverテーブルの確認 ===")
+silver_cust_count = spark.table(f"{ns}.med_customers__silver").count()
+print(f"Silver 顧客マスタ 総行数: {silver_cust_count}")
+
+print("\n【Silverテーブルのサンプル】")
+display(spark.sql(f"SELECT * FROM {ns}.med_customers__silver LIMIT 10"))
 
 # COMMAND ----------
 
@@ -436,3 +604,6 @@ for s in spark.streams.active:
 # MAGIC
 # MAGIC > 本ノートの `med_*` は学習用（少量サンプル）。**②以降は、同じ tpch 受注データの全量版** `orders_silver` / `sales_monthly_gold`（`_setup` 作成）を使います。データソースは一貫して tpch の受注データです。
 # MAGIC 次は **②AI関数とインサイト** へ。
+
+# COMMAND ----------
+
